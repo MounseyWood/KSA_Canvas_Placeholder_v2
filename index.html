@@ -2,30 +2,47 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Layered Variable-Width Grid with Jostle & Hover Expansion</title>
+  <title>Full-Screen Multi-Row Grid with Hover Expansion</title>
   <!-- p5.js library -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
   <style>
-    body { margin: 0; overflow: hidden; }
+    body {
+      margin: 0;
+      overflow: hidden;
+    }
   </style>
 </head>
 <body>
   <script>
-    // Global base settings:
-    let globalScale = 1;       // Adjusted with mouse wheel
-    let basePadding = 10;      // Horizontal padding for each text cell
-    let baseVPadding = 6;      // Vertical padding
-    let noiseScale = 0.03;     // For blocky color selection
-    let t = 0;                 // Time variable for noise animation
-
-    // Day mode (0) or Night mode (1)
-    let mode = 0;
-
-    // CSV words will be loaded from words.csv (which must be in the same folder)
+    // We'll load words from a CSV file with header "word" in the same folder.
     let wordTable;
     let words = [];
 
-    // Preload CSV file
+    // Multi-row "cell" data structure (one for each displayed cell)
+    // We'll fill the screen by repeating words until we run out of space.
+    let cells = [];
+
+    // Global scale factor (adjusted by mouse wheel).
+    let globalScale = 1;
+
+    // Adjacency expansions (by index distance).
+    let expansionMap = [3.0, 2.0, 1.5, 1.25];
+
+    // Day (0) or Night (1).
+    let mode = 0;
+
+    // Noise parameters for color thresholds and jostle.
+    let noiseScale = 0.03;
+    let t = 0; // time for color animation
+    let jostleSpeed = 0.01; // speed of Perlin noise for jostling
+    let jostleAmp = 5;      // how many pixels to move each cell
+
+    // Base text size and padding for measuring
+    let baseTextSize = 12;
+    let baseHPadding = 10;  // horizontal padding around the text
+    let baseVPadding = 6;   // vertical padding
+
+    // Preload CSV
     function preload() {
       wordTable = loadTable('words.csv', 'csv', 'header');
     }
@@ -34,196 +51,255 @@
       createCanvas(windowWidth, windowHeight);
       textAlign(LEFT, TOP);
       noStroke();
-      // Load words from CSV
+
+      // Read words from CSV
       for (let i = 0; i < wordTable.getRowCount(); i++) {
         words.push(wordTable.getString(i, 'word'));
+      }
+
+      // We measure each word's base width at the default text size (12).
+      textSize(baseTextSize);
+      
+      // We'll build an internal array of "word data" with measured widths.
+      // This helps us quickly create cells to fill the screen.
+      let wordData = [];
+      for (let w of words) {
+        let wWidth = textWidth(w) + baseHPadding;
+        let wHeight = textAscent() + textDescent() + baseVPadding;
+        wordData.push({ text: w, baseW: wWidth, baseH: wHeight });
+      }
+
+      // Fill the entire screen with repeated words (in row-based layout)
+      // using the *base scale* (globalScale=1) as a reference.
+      // Then each frame, we'll re-layout them according to the actual globalScale.
+      let xPos = 10;  // left margin
+      let yPos = 10;  // top margin
+      let rowHeight = 0;
+      let index = 0;  // index for adjacency expansions
+      let wIndex = 0; // index into wordData
+
+      while (true) {
+        let wInfo = wordData[wIndex];
+        // The cell's "baseline" width & height (no expansions, scale=1).
+        let cW = wInfo.baseW;
+        let cH = wInfo.baseH;
+
+        // If we can't fit this cell in the current row, move to next row.
+        if (xPos + cW > width - 10) {
+          xPos = 10;
+          yPos += rowHeight + 5; // small vertical gap
+          rowHeight = 0;
+        }
+
+        // If we exceed the screen vertically, stop filling.
+        if (yPos + cH > height - 10) {
+          break;
+        }
+
+        // Create a cell object
+        cells.push({
+          index: index,
+          word: wInfo.text,
+          baseW: wInfo.baseW,
+          baseH: wInfo.baseH,
+          // We'll store a "layout" x,y that is updated each frame.
+          x: xPos,
+          y: yPos,
+          multiplier: 1, // adjacency expansion factor
+          jostleSeedX: random(1000),
+          jostleSeedY: random(1000),
+        });
+
+        // Update row
+        xPos += cW;
+        if (cH > rowHeight) {
+          rowHeight = cH;
+        }
+
+        // Advance indexes
+        index++;
+        wIndex = (wIndex + 1) % wordData.length;
       }
     }
 
     function draw() {
-      // Draw plain background (so gaps between cells show through)
+      // Plain background for day/night
       if (mode === 0) {
-        background(255);  // Day: white background
+        background(255); // Day: white
       } else {
-        background(0);    // Night: black background
+        background(0);   // Night: black
       }
-      
-      // --- Layout cells into rows with default (multiplier = 1) ---
-      // We compute a "default layout" for each cell (its baseline position)
-      let marginX = 10, marginY = 10;
-      let rows = []; // Each row will be an object: { cells: [], y: number, height: number }
-      let currentRow = [];
-      let xPos = marginX;
-      let yPos = marginY;
+
+      // 1) Identify the hovered cell (if any).
+      //    We'll do a quick pass with multiplier=1 for all, to approximate bounding boxes.
+      let hoveredIndex = findHoveredCellApprox();
+
+      // 2) Assign multipliers based on adjacency in index space.
+      assignLocalMultipliers(hoveredIndex);
+
+      // 3) Re-layout all cells according to their multiplier + global scale.
+      layoutCells();
+
+      // 4) Sort cells by multiplier so that largest draws last => on top
+      cells.sort((a, b) => a.multiplier - b.multiplier);
+
+      // 5) Draw cells
+      for (let c of cells) {
+        drawCell(c);
+      }
+
+      // Animate the noise
+      t += 0.01;
+    }
+
+    // Approximate bounding boxes with multiplier=1, to see if mouse is inside.
+    function findHoveredCellApprox() {
+      // Temporarily set multiplier=1, do a quick layout, then check bounding boxes.
+      for (let c of cells) {
+        c.multiplier = 1;
+      }
+      layoutCells();
+
+      // Check from the end forward so topmost cells get priority if overlap
+      for (let i = cells.length - 1; i >= 0; i--) {
+        let c = cells[i];
+        let left = c.x;
+        let right = c.x + c.baseW * globalScale;
+        let top = c.y;
+        let bottom = c.y + c.baseH * globalScale;
+        if (mouseX >= left && mouseX <= right && mouseY >= top && mouseY <= bottom) {
+          return c.index;
+        }
+      }
+      return -1;
+    }
+
+    // Adjacency expansions based on index distance
+    function assignLocalMultipliers(hoveredIndex) {
+      if (hoveredIndex < 0) {
+        // No hover
+        for (let c of cells) {
+          c.multiplier = 1;
+        }
+        return;
+      }
+      for (let c of cells) {
+        let d = abs(c.index - hoveredIndex);
+        if (d < expansionMap.length) {
+          c.multiplier = expansionMap[d];
+        } else {
+          c.multiplier = 1;
+        }
+      }
+    }
+
+    // Recompute x,y for each cell in a row-based manner, using updated multipliers
+    function layoutCells() {
+      textSize(baseTextSize * globalScale);
+
+      let xPos = 10;
+      let yPos = 10;
       let rowHeight = 0;
-      
-      // For each word in order:
-      for (let i = 0; i < words.length; i++) {
-        // Measure text dimensions at base size (textSize(12) is our reference)
-        let txt = words[i];
-        let baseW = textWidth(txt) + basePadding;
-        let baseH = textAscent() + textDescent() + baseVPadding;
-        // Effective width using default multiplier = 1 and globalScale:
-        let effW = baseW * globalScale;
-        let effH = baseH * globalScale;
-        
-        // If adding this cell exceeds canvas width, finish the current row:
-        if (xPos + effW > width - marginX) {
-          rows.push({ cells: currentRow, y: yPos, height: rowHeight });
-          currentRow = [];
-          yPos += rowHeight + marginY;
-          xPos = marginX;
+
+      for (let i = 0; i < cells.length; i++) {
+        let c = cells[i];
+        // Effective width, height with expansions
+        let effW = c.baseW * globalScale * c.multiplier;
+        let effH = c.baseH * globalScale * c.multiplier;
+
+        // If we can't fit in current row, move to next row
+        if (xPos + effW > width - 10) {
+          xPos = 10;
+          yPos += rowHeight + 5;
           rowHeight = 0;
         }
-        
-        // Save baseline properties for this cell
-        currentRow.push({
-          word: txt,
-          baseW: baseW,
-          baseH: baseH,
-          // Default baseline x (for hover detection later)
-          defaultX: xPos,
-          // These will be computed later after multiplier assignment:
-          x: 0, y: 0, effW: 0, effH: 0,
-          multiplier: 1  // default multiplier
-        });
+
+        c.x = xPos;
+        c.y = yPos;
         xPos += effW;
         if (effH > rowHeight) rowHeight = effH;
+
+        // If we exceed screen height, we don't forcibly break,
+        // but some cells might end up off-screen if expansions are large.
       }
-      // Push any remaining row:
-      if (currentRow.length > 0) {
-        rows.push({ cells: currentRow, y: yPos, height: rowHeight });
-      }
-      
-      // --- For each row, update multipliers if the mouse is over that row ---
-      for (let r = 0; r < rows.length; r++) {
-        let row = rows[r];
-        // Check if mouseY falls within this row's vertical range:
-        if (mouseY >= row.y && mouseY <= row.y + row.height) {
-          // Determine hovered cell in this row based on default layout:
-          let hoverIndex = -1;
-          for (let i = 0; i < row.cells.length; i++) {
-            let cell = row.cells[i];
-            let effW = cell.baseW * globalScale;  // default effective width
-            if (mouseX >= cell.defaultX && mouseX <= cell.defaultX + effW) {
-              hoverIndex = i;
-              break;
-            }
-          }
-          // Assign multipliers for cells in this row:
-          if (hoverIndex >= 0) {
-            for (let i = 0; i < row.cells.length; i++) {
-              let d = abs(i - hoverIndex);
-              if (d === 0) row.cells[i].multiplier = 3.0;
-              else if (d === 1) row.cells[i].multiplier = 2.0;
-              else if (d === 2) row.cells[i].multiplier = 1.5;
-              else if (d === 3) row.cells[i].multiplier = 1.25;
-              else row.cells[i].multiplier = 1.0;
-            }
-          }
-        } else {
-          // For rows not hovered, keep multiplier = 1.
-          for (let cell of row.cells) {
-            cell.multiplier = 1.0;
-          }
-        }
-        
-        // --- Re-layout this row using the updated multipliers ---
-        let xPosRow = marginX;
-        let maxH = 0;
-        for (let i = 0; i < row.cells.length; i++) {
-          let cell = row.cells[i];
-          let effW = cell.baseW * globalScale * cell.multiplier;
-          let effH = cell.baseH * globalScale * cell.multiplier;
-          cell.x = xPosRow;
-          // Vertically center the cell in the row (using the row's original height)
-          cell.y = row.y + (row.height - effH) / 2;
-          cell.effW = effW;
-          cell.effH = effH;
-          xPosRow += effW;  // push next cell to the right edge
-          if (effH > maxH) maxH = effH;
-        }
-        row.height = maxH;
-      }
-      
-      // --- Draw each row's cells using a layered approach ---
-      // For each row, we draw the cells sorted by multiplier (lowest drawn first).
-      for (let r = 0; r < rows.length; r++) {
-        let row = rows[r];
-        // Create a sorted copy of the row's cells:
-        let sortedCells = row.cells.slice().sort((a, b) => a.multiplier - b.multiplier);
-        for (let i = 0; i < sortedCells.length; i++) {
-          let cell = sortedCells[i];
-          push();
-          // Apply a slight jostle to each cell using Perlin noise:
-          let jostleX = map(noise(cell.x * 0.01, row.y * 0.01, t), 0, 1, -5, 5);
-          let jostleY = map(noise(cell.x * 0.01 + 100, row.y * 0.01 + 100, t), 0, 1, -5, 5);
-          translate(cell.x + jostleX, cell.y + jostleY);
-          
-          // Choose a blocky color scheme for the cell using noise:
-          let n = noise(cell.x * noiseScale + 555, cell.y * noiseScale + 555, t);
-          if (mode === 0) {
-            // Day mode:
-            // n < 0.33 => black background, yellow text (#ffed00)
-            // n < 0.66 => yellow background, black text
-            // else     => white background, black text
-            if (n < 0.33) {
-              fill(0);
-              rect(0, 0, cell.effW, cell.effH);
-              fill('#ffed00');
-            } else if (n < 0.66) {
-              fill('#ffed00');
-              rect(0, 0, cell.effW, cell.effH);
-              fill(0);
-            } else {
-              fill(255);
-              rect(0, 0, cell.effW, cell.effH);
-              fill(0);
-            }
-          } else {
-            // Night mode:
-            // n < 0.33 => white background, blue text (rgb(0,146,212))
-            // n < 0.66 => blue background, white text
-            // else     => black background, white text
-            if (n < 0.33) {
-              fill(255);
-              rect(0, 0, cell.effW, cell.effH);
-              fill(0,146,212);
-            } else if (n < 0.66) {
-              fill(0,146,212);
-              rect(0, 0, cell.effW, cell.effH);
-              fill(255);
-            } else {
-              fill(0);
-              rect(0, 0, cell.effW, cell.effH);
-              fill(255);
-            }
-          }
-          
-          // If this cell is the hovered one (multiplier 3), draw text bold
-          if (cell.multiplier >= 3) textStyle(BOLD);
-          else textStyle(NORMAL);
-          
-          textSize(12 * globalScale);
-          text(cell.word, 5, 3);
-          pop();
-        }
-      }
-      
-      t += 0.01;  // animate noise over time
     }
-    
-    // Toggle day/night mode on mouse click
+
+    // Draw one cell with noise-based color and slight jostle
+    function drawCell(c) {
+      push();
+      // Slight jostle
+      let xJ = (noise(c.jostleSeedX + frameCount * jostleSpeed) - 0.5) * jostleAmp;
+      let yJ = (noise(c.jostleSeedY + frameCount * jostleSpeed) - 0.5) * jostleAmp;
+      translate(c.x + xJ, c.y + yJ);
+
+      // Color scheme thresholds
+      let n = noise(c.x * noiseScale + 555, c.y * noiseScale + 555, t);
+      // Determine cell width/height in the draw space
+      let drawW = c.baseW * globalScale * c.multiplier;
+      let drawH = c.baseH * globalScale * c.multiplier;
+
+      if (mode === 0) {
+        // Day mode:
+        // n < 0.33 => black bg, #ffed00 text
+        // n < 0.66 => #ffed00 bg, black text
+        // else     => white bg, black text
+        if (n < 0.33) {
+          fill(0); // black
+          rect(0, 0, drawW, drawH);
+          fill('#ffed00');
+        } else if (n < 0.66) {
+          fill('#ffed00');
+          rect(0, 0, drawW, drawH);
+          fill(0);
+        } else {
+          fill(255);
+          rect(0, 0, drawW, drawH);
+          fill(0);
+        }
+      } else {
+        // Night mode:
+        // n < 0.33 => white bg, blue text (0,146,212)
+        // n < 0.66 => blue bg, white text
+        // else     => black bg, white text
+        if (n < 0.33) {
+          fill(255);
+          rect(0, 0, drawW, drawH);
+          fill(0,146,212);
+        } else if (n < 0.66) {
+          fill(0,146,212);
+          rect(0, 0, drawW, drawH);
+          fill(255);
+        } else {
+          fill(0);
+          rect(0, 0, drawW, drawH);
+          fill(255);
+        }
+      }
+
+      // Bold if multiplier is 3
+      if (c.multiplier >= 3) {
+        textStyle(BOLD);
+      } else {
+        textStyle(NORMAL);
+      }
+
+      textSize(baseTextSize * globalScale);
+      text(c.word, 5, 3);
+      pop();
+    }
+
+    // Toggle day/night mode
     function mousePressed() {
       mode = (mode + 1) % 2;
     }
-    
-    // Zoom in/out using the mouse wheel (adjusts globalScale)
+
+    // Mouse wheel => zoom
     function mouseWheel(event) {
       globalScale = constrain(globalScale - event.delta * 0.001, 0.5, 5);
       return false;
     }
-    
+
+    // Keep canvas full screen
     function windowResized() {
       resizeCanvas(windowWidth, windowHeight);
     }
