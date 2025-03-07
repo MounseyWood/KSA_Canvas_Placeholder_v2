@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Full-Screen Multi-Row Grid with Hover Expansion</title>
+  <title>Full-Screen Multi-Row Grid with Smooth Hover Expansion</title>
   <!-- p5.js library -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
   <style>
@@ -14,12 +14,23 @@
 </head>
 <body>
   <script>
-    // We'll load words from a CSV file with header "word" in the same folder.
+    // We'll load words from a CSV file with a header "word" in the same folder.
     let wordTable;
     let words = [];
 
-    // Multi-row "cell" data structure (one for each displayed cell)
-    // We'll fill the screen by repeating words until we run out of space.
+    // Each cell:
+    // {
+    //   index: number,       // for adjacency expansions
+    //   word: string,        // text
+    //   baseW: number,       // measured width at base scale=1
+    //   baseH: number,       // measured height at base scale=1
+    //   x: number,           // layout position
+    //   y: number,
+    //   jostleSeedX: number, // for noise-based jostle
+    //   jostleSeedY: number,
+    //   currentMult: number, // actual multiplier used for layout & drawing
+    //   targetMult: number,  // desired multiplier (based on hover adjacency)
+    // }
     let cells = [];
 
     // Global scale factor (adjusted by mouse wheel).
@@ -39,8 +50,12 @@
 
     // Base text size and padding for measuring
     let baseTextSize = 12;
-    let baseHPadding = 10;  // horizontal padding around the text
-    let baseVPadding = 6;   // vertical padding
+    // Increase horizontal padding to match row spacing visually
+    let baseHPadding = 12;  
+    let baseVPadding = 6;   
+
+    // Row spacing
+    let rowGap = 10;  
 
     // Preload CSV
     function preload() {
@@ -57,11 +72,10 @@
         words.push(wordTable.getString(i, 'word'));
       }
 
-      // We measure each word's base width at the default text size (12).
+      // Measure each word's base width/height at the default text size (12).
       textSize(baseTextSize);
       
-      // We'll build an internal array of "word data" with measured widths.
-      // This helps us quickly create cells to fill the screen.
+      // Build an internal array of "word data" with measured widths.
       let wordData = [];
       for (let w of words) {
         let wWidth = textWidth(w) + baseHPadding;
@@ -70,53 +84,48 @@
       }
 
       // Fill the entire screen with repeated words (in row-based layout)
-      // using the *base scale* (globalScale=1) as a reference.
-      // Then each frame, we'll re-layout them according to the actual globalScale.
-      let xPos = 10;  // left margin
-      let yPos = 10;  // top margin
+      // at base scale=1. Each cell gets index-based adjacency expansions.
+      let xPos = 10;  
+      let yPos = 10;  
       let rowHeight = 0;
-      let index = 0;  // index for adjacency expansions
-      let wIndex = 0; // index into wordData
+      let index = 0;  
+      let wIndex = 0; 
 
       while (true) {
         let wInfo = wordData[wIndex];
-        // The cell's "baseline" width & height (no expansions, scale=1).
         let cW = wInfo.baseW;
         let cH = wInfo.baseH;
 
-        // If we can't fit this cell in the current row, move to next row.
+        // If we can't fit in the current row, move to next row
         if (xPos + cW > width - 10) {
           xPos = 10;
-          yPos += rowHeight + 5; // small vertical gap
+          yPos += rowHeight + rowGap;
           rowHeight = 0;
         }
 
-        // If we exceed the screen vertically, stop filling.
+        // If we exceed the screen vertically, stop filling
         if (yPos + cH > height - 10) {
           break;
         }
 
-        // Create a cell object
         cells.push({
           index: index,
           word: wInfo.text,
           baseW: wInfo.baseW,
           baseH: wInfo.baseH,
-          // We'll store a "layout" x,y that is updated each frame.
           x: xPos,
           y: yPos,
-          multiplier: 1, // adjacency expansion factor
           jostleSeedX: random(1000),
           jostleSeedY: random(1000),
+          currentMult: 1,
+          targetMult: 1,
         });
 
-        // Update row
         xPos += cW;
         if (cH > rowHeight) {
           rowHeight = cH;
         }
 
-        // Advance indexes
         index++;
         wIndex = (wIndex + 1) % wordData.length;
       }
@@ -130,41 +139,45 @@
         background(0);   // Night: black
       }
 
-      // 1) Identify the hovered cell (if any).
-      //    We'll do a quick pass with multiplier=1 for all, to approximate bounding boxes.
+      // 1) Find the hovered cell (approx) with multiplier=1 for bounding boxes
       let hoveredIndex = findHoveredCellApprox();
 
-      // 2) Assign multipliers based on adjacency in index space.
-      assignLocalMultipliers(hoveredIndex);
+      // 2) Assign target multipliers based on adjacency
+      setTargetMultipliers(hoveredIndex);
 
-      // 3) Re-layout all cells according to their multiplier + global scale.
+      // 3) Smoothly move currentMult toward targetMult (slower expansion)
+      for (let c of cells) {
+        c.currentMult = lerp(c.currentMult, c.targetMult, 0.15); 
+      }
+
+      // 4) Re-layout using each cell's currentMult + globalScale
       layoutCells();
 
-      // 4) Sort cells by multiplier so that largest draws last => on top
-      cells.sort((a, b) => a.multiplier - b.multiplier);
+      // 5) Sort cells by currentMult so largest is drawn on top
+      cells.sort((a, b) => a.currentMult - b.currentMult);
 
-      // 5) Draw cells
+      // 6) Draw cells
       for (let c of cells) {
         drawCell(c);
       }
 
-      // Animate the noise
-      t += 0.01;
+      t += 0.01; // animate noise
     }
 
-    // Approximate bounding boxes with multiplier=1, to see if mouse is inside.
+    // Step 1: approximate bounding boxes with multiplier=1
     function findHoveredCellApprox() {
-      // Temporarily set multiplier=1, do a quick layout, then check bounding boxes.
+      // Temporarily set targetMult=1 and currentMult=1
       for (let c of cells) {
-        c.multiplier = 1;
+        c.currentMult = 1;
       }
       layoutCells();
 
-      // Check from the end forward so topmost cells get priority if overlap
+      // Check from top to bottom (or reverse) to see if mouse is in bounding box
+      // We'll go from the end forward so that later (rightmost/lower) cells get priority
       for (let i = cells.length - 1; i >= 0; i--) {
         let c = cells[i];
         let left = c.x;
-        let right = c.x + c.baseW * globalScale;
+        let right = c.x + c.baseW * globalScale; // approximate
         let top = c.y;
         let bottom = c.y + c.baseH * globalScale;
         if (mouseX >= left && mouseX <= right && mouseY >= top && mouseY <= bottom) {
@@ -174,26 +187,26 @@
       return -1;
     }
 
-    // Adjacency expansions based on index distance
-    function assignLocalMultipliers(hoveredIndex) {
+    // Step 2: set targetMult for each cell based on adjacency to hoveredIndex
+    function setTargetMultipliers(hoveredIndex) {
       if (hoveredIndex < 0) {
         // No hover
         for (let c of cells) {
-          c.multiplier = 1;
+          c.targetMult = 1;
         }
         return;
       }
       for (let c of cells) {
         let d = abs(c.index - hoveredIndex);
         if (d < expansionMap.length) {
-          c.multiplier = expansionMap[d];
+          c.targetMult = expansionMap[d];
         } else {
-          c.multiplier = 1;
+          c.targetMult = 1;
         }
       }
     }
 
-    // Recompute x,y for each cell in a row-based manner, using updated multipliers
+    // Step 4: re-layout the cells row-by-row
     function layoutCells() {
       textSize(baseTextSize * globalScale);
 
@@ -203,14 +216,13 @@
 
       for (let i = 0; i < cells.length; i++) {
         let c = cells[i];
-        // Effective width, height with expansions
-        let effW = c.baseW * globalScale * c.multiplier;
-        let effH = c.baseH * globalScale * c.multiplier;
+        let effW = c.baseW * globalScale * c.currentMult;
+        let effH = c.baseH * globalScale * c.currentMult;
 
-        // If we can't fit in current row, move to next row
+        // If we can't fit in the current row, move to next
         if (xPos + effW > width - 10) {
           xPos = 10;
-          yPos += rowHeight + 5;
+          yPos += rowHeight + rowGap;
           rowHeight = 0;
         }
 
@@ -218,13 +230,10 @@
         c.y = yPos;
         xPos += effW;
         if (effH > rowHeight) rowHeight = effH;
-
-        // If we exceed screen height, we don't forcibly break,
-        // but some cells might end up off-screen if expansions are large.
       }
     }
 
-    // Draw one cell with noise-based color and slight jostle
+    // Step 6: draw each cell
     function drawCell(c) {
       push();
       // Slight jostle
@@ -232,19 +241,18 @@
       let yJ = (noise(c.jostleSeedY + frameCount * jostleSpeed) - 0.5) * jostleAmp;
       translate(c.x + xJ, c.y + yJ);
 
-      // Color scheme thresholds
       let n = noise(c.x * noiseScale + 555, c.y * noiseScale + 555, t);
-      // Determine cell width/height in the draw space
-      let drawW = c.baseW * globalScale * c.multiplier;
-      let drawH = c.baseH * globalScale * c.multiplier;
+      let drawW = c.baseW * globalScale * c.currentMult;
+      let drawH = c.baseH * globalScale * c.currentMult;
 
+      // Color scheme thresholds
       if (mode === 0) {
         // Day mode:
         // n < 0.33 => black bg, #ffed00 text
         // n < 0.66 => #ffed00 bg, black text
         // else     => white bg, black text
         if (n < 0.33) {
-          fill(0); // black
+          fill(0);
           rect(0, 0, drawW, drawH);
           fill('#ffed00');
         } else if (n < 0.66) {
@@ -276,8 +284,8 @@
         }
       }
 
-      // Bold if multiplier is 3
-      if (c.multiplier >= 3) {
+      // Bold if currentMult >= 3
+      if (c.currentMult >= 2.9) {
         textStyle(BOLD);
       } else {
         textStyle(NORMAL);
